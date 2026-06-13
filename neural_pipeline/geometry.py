@@ -158,6 +158,53 @@ def axis_angle_to_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     return R
 
 
+def detect_floor_normal(pts_cam: np.ndarray,
+                        distance_threshold: float = 0.002,
+                        ransac_n: int = 3,
+                        num_iterations: int = 1000) -> Tuple[np.ndarray, float]:
+    """RANSAC a plane from camera-space points and return (unit_normal, d).
+
+    The normal is oriented so that it points *away* from the camera (i.e.
+    has a positive Z component in camera space, matching the convention that
+    the floor is in front of the camera and the up-direction points into the
+    scene).  ``d`` is the signed offset such that ``normal . p + d = 0``
+    for points on the floor.
+    """
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts_cam.astype(np.float64))
+    plane_model, _ = pcd.segment_plane(
+        distance_threshold=distance_threshold,
+        ransac_n=ransac_n,
+        num_iterations=num_iterations,
+    )
+    n = np.array(plane_model[:3], dtype=np.float64)
+    n /= np.linalg.norm(n)
+    d = float(plane_model[3])
+    if n[1] < 0:
+        n, d = -n, -d
+    return n, d
+
+
+def floor_up_rotation(n_floor_cam: np.ndarray) -> np.ndarray:
+    """3x3 rotation that maps ``n_floor_cam`` onto +Y = [0, 1, 0].
+
+    After applying this rotation to camera-space points the floor normal
+    is aligned with +Y, the floor is roughly at Y = const, and the only
+    remaining unknown in turntable registration is yaw about Y.
+    """
+    target = np.array([0.0, 1.0, 0.0])
+    n = n_floor_cam / np.linalg.norm(n_floor_cam)
+    c = float(np.dot(n, target))
+    cross = np.cross(n, target)
+    s = float(np.linalg.norm(cross))
+    if s < 1e-8:
+        return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    axis = cross / s
+    angle = math.atan2(s, c)
+    return axis_angle_to_matrix(axis, angle)
+
+
 def _backproject_full(
     depth: np.ndarray, K: Intrinsics, stride: int = 1
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -794,6 +841,87 @@ def render_preview(
         LOG.warning("GL preview failed (%s); falling back to matplotlib renderer.", e)
 
     _matplotlib_preview(mesh, out_png, up_axis_world=up, n_views=n_views)
+
+
+def auto_segment_stone(
+    depth: np.ndarray,
+    K: Intrinsics,
+    stone_height_thresh_m: float = 1.0e-3,
+    cluster_eps_m: float = 2.0e-3,
+    cluster_min_points: int = 30,
+    floor_inlier_min_ratio: float = 0.4,
+    pixel_stride: int = 2,
+    max_stone_fraction: float = 0.4,
+) -> Tuple[np.ndarray, FloorFit]:
+    """Find the floor plane and the stone region from a depth image.
+
+    Returns ``(stone_pixel_mask, floor_fit)`` where ``stone_pixel_mask`` is
+    a boolean array of shape ``depth.shape``.
+    """
+    H, W = depth.shape
+
+    pts_sub, _ = _backproject_full(depth, K, stride=pixel_stride)
+
+    floor: Optional[FloorFit] = None
+    for thresh in (3e-4, 6e-4, 1e-3):
+        fit, _ = _fit_floor_plane(pts_sub, distance_threshold=thresh)
+        if fit.inlier_ratio >= floor_inlier_min_ratio:
+            floor = fit
+            break
+    if floor is None:
+        LOG.warning(
+            "Floor RANSAC inlier ratio low (%.2f); accepting anyway.",
+            fit.inlier_ratio,
+        )
+        floor = fit
+    LOG.info(
+        "Floor plane: n=[%.4f, %.4f, %.4f] d=%.5f (inlier_ratio=%.2f)",
+        floor.normal[0], floor.normal[1], floor.normal[2], floor.d, floor.inlier_ratio,
+    )
+
+    pts_full, idx_full = _backproject_full(depth, K, stride=1)
+    above = pts_full @ floor.normal + floor.d
+    cand = above >= stone_height_thresh_m
+    if cand.sum() < cluster_min_points:
+        LOG.warning("Auto-segment found no stone candidates above %.2f mm",
+                    stone_height_thresh_m * 1000.0)
+        return np.zeros((H, W), dtype=bool), floor
+
+    cand_pts = pts_full[cand]
+    cand_idx = idx_full[cand]
+    pcd_cand = make_pcd(cand_pts)
+    labels = np.asarray(
+        pcd_cand.cluster_dbscan(eps=cluster_eps_m, min_points=cluster_min_points,
+                                print_progress=False)
+    )
+
+    if labels.size == 0 or labels.max() < 0:
+        LOG.warning("DBSCAN found no clusters in stone candidates")
+        return np.zeros((H, W), dtype=bool), floor
+
+    n_clusters = int(labels.max() + 1)
+    sizes = [int((labels == k).sum()) for k in range(n_clusters)]
+    largest = int(np.argmax(sizes))
+    sel = labels == largest
+    stone_idx = cand_idx[sel]
+
+    stone_fraction = stone_idx.size / float(H * W)
+    if stone_fraction > max_stone_fraction:
+        LOG.warning(
+            "Auto-segment cluster covers %.1f%% of pixels (>%.0f%%); "
+            "treating as failure.",
+            100 * stone_fraction, 100 * max_stone_fraction,
+        )
+        return np.zeros((H, W), dtype=bool), floor
+
+    mask = np.zeros(H * W, dtype=bool)
+    mask[stone_idx] = True
+    mask = mask.reshape(H, W)
+    LOG.info(
+        "Auto-segment: %d stone pixels (%.2f%% of image), cluster=%d/%d",
+        int(mask.sum()), 100 * stone_fraction, largest, n_clusters,
+    )
+    return mask, floor
 
 
 def write_segmentation_preview(
